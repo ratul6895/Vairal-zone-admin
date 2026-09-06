@@ -1,5 +1,6 @@
 import os
 import io
+import json
 import logging
 from PIL import Image
 from dotenv import load_dotenv
@@ -29,14 +30,18 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MINI_APP_BOT_USERNAME = os.getenv("MINI_APP_BOT_USERNAME")
 MINI_APP_SHORT_NAME = os.getenv("MINI_APP_SHORT_NAME")
 ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
-FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS")
+FIREBASE_CREDENTIALS_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON")
 
-# ফায়ারবেস ইনিশিয়ালাইজেশন
+# ফায়ারবেস ইনিশিয়ালাইজেশন (নিরাপদ পদ্ধতি)
 if not firebase_admin._apps:
     if os.path.exists("firebase_key.json"):
         cred = credentials.Certificate("firebase_key.json")
+    elif FIREBASE_CREDENTIALS_JSON:
+        cred_dict = json.loads(FIREBASE_CREDENTIALS_JSON)
+        cred = credentials.Certificate(cred_dict)
     else:
-        cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+        raise ValueError("Firebase credentials not found! Please check firebase_key.json or environment variables.")
+    
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
