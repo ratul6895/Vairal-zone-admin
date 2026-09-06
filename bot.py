@@ -50,8 +50,8 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
-# কনভারসেশন স্টেটস
-TITLE, CATEGORY, ADS_COUNT, VIDEO_LINK, THUMBNAIL, CHANNELS = range(6)
+# কনভারসেশন স্টেটস (নতুন ADD_CHANNEL সহ)
+TITLE, CATEGORY, ADS_COUNT, VIDEO_LINK, THUMBNAIL, CHANNELS, ADD_CHANNEL = range(7)
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -174,7 +174,6 @@ async def channel_selection_callback(update: Update, context: ContextTypes.DEFAU
             await query.edit_message_text("⚠️ কমপক্ষে একটি চ্যানেল সিলেক্ট করুন!")
             return CHANNELS
         
-        # ১. ফায়ারবেসে পোস্ট ডাটা সেভ করা এবং ইউনিক আইডি জেনারেট
         post_ref = db.collection("posts").document()
         post_id = post_ref.id
         
@@ -187,10 +186,8 @@ async def channel_selection_callback(update: Update, context: ContextTypes.DEFAU
         }
         post_ref.set(post_data)
         
-        # ২. মিনি অ্যাপের ডিপ লিংক তৈরি
         deep_link = f"https://t.me/{MINI_APP_BOT_USERNAME}/{MINI_APP_SHORT_NAME}?startapp={post_id}"
         
-        # ৩. চ্যানেলগুলোতে পোস্ট পাঠানো
         keyboard = [[InlineKeyboardButton("🎥 Watch Video in App", url=deep_link)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -217,7 +214,6 @@ async def channel_selection_callback(update: Update, context: ContextTypes.DEFAU
         else:
             selected.append(ch_id)
         
-        # মার্কআপ রিলোড করা
         channels_ref = db.collection("channels").stream()
         keyboard = []
         for ch in channels_ref:
@@ -239,19 +235,67 @@ async def manage_categories_menu(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     await query.message.reply_text("📁 ক্যাটেগরি ম্যানেজ করতে আপনার Firebase Firestore কনসোলে `categories` কালেকশনে একটি ডকুমেন্ট তৈরি করুন যেখানে `name` ফিল্ড থাকবে।")
 
+# --- নতুন চ্যানেল ম্যানেজমেন্ট ও অটো-অ্যাড সিস্টেম ---
 async def manage_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("➕ চ্যানেল যোগ করতে আপনার Firebase Firestore কনসোলে `channels` কালেকশনে ডকুমেন্ট তৈরি করুন যেখানে `channel_id` এবং `name` ফিল্ড থাকবে।")
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Add New Channel", callback_data="add_channel_prompt")],
+        [InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.message.edit_text(
+        "➕ **Channel Management**\n\nবটটিকে আপনার টেলিগ্রাম চ্যানেলে **Admin** হিসেবে যুক্ত করুন। এরপর নিচের বাটনে ক্লিক করে চ্যানেলের ইউজারনেম (যেমন: `@mychannel`) দিন:",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+    return ADD_CHANNEL
+
+async def prompt_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("📢 যে চ্যানেলে বট অ্যাড করেছেন, সেই চ্যানেলের ইউজারনেম পাঠান (যেমন: `@mychannel`):")
+    return ADD_CHANNEL
+
+async def save_channel_to_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    
+    if text.lower() == "/start":
+        return await start(update, context)
+
+    try:
+        chat = await context.bot.get_chat(text)
+        channel_id = str(chat.id)
+        channel_name = chat.title
+        
+        db.collection("channels").document(channel_id).set({
+            "channel_id": channel_id,
+            "name": channel_name,
+            "username": chat.username or ""
+        })
+        
+        await update.message.reply_text(
+            f"✅ সফলভাবে চ্যানেল যুক্ত হয়েছে!\n\n📌 **নাম:** {channel_name}\n🆔 **আইডি:** `{channel_id}`",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"Error adding channel: {e}")
+        await update.message.reply_text(
+            "❌ চ্যানেল খুঁজে পাওয়া যায়নি! নিশ্চিত করুন যে:\n1. বটটি ওই চ্যানেলে অ্যাড করা আছে।\n2. বটটিকে চ্যানেলের **Admin** করা হয়েছে।\n3. সঠিক ইউজারনেম দেওয়া হয়েছে (যেমন: `@channelname`)।"
+        )
+    
+    return ConversationHandler.END
 
 def main():
-    # টাইমআউট সমস্যা সমাধানের জন্য রিকোয়েস্ট কনফিগারেশন যুক্ত করা হলো
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
 
     conv_handler = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(publish_start, pattern="^menu_publish$"),
+            CallbackQueryHandler(manage_channels_menu, pattern="^menu_channels$"),
             CommandHandler("start", start)
         ],
         states={
@@ -261,16 +305,20 @@ def main():
             VIDEO_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_video_link)],
             THUMBNAIL: [MessageHandler(filters.PHOTO, get_thumbnail)],
             CHANNELS: [CallbackQueryHandler(channel_selection_callback)],
+            ADD_CHANNEL: [
+                CallbackQueryHandler(prompt_add_channel, pattern="^add_channel_prompt$"),
+                CallbackQueryHandler(start, pattern="^back_to_main$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_channel_to_firebase)
+            ],
         },
         fallbacks=[CommandHandler("start", start)],
     )
 
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(manage_categories_menu, pattern="^menu_categories$"))
-    app.add_handler(CallbackQueryHandler(manage_channels_menu, pattern="^menu_channels$"))
     app.add_handler(CommandHandler("start", start))
 
-    print("Admin Bot is running smoothly...")
+    print("Admin Bot is running smoothly with Auto Channel Add...")
     app.run_polling()
 
 if __name__ == "__main__":
