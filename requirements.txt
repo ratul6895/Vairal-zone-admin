@@ -1,4 +1,7 @@
-python-telegram-bot==20.8
-firebase-admin==6.5.0
-Pillow>=10.4.0
-python-dotenv==1.0.1
+flask
+telegram
+python-telegram-bot
+firebase-admin
+pillow
+python-dotenv
+httpx
