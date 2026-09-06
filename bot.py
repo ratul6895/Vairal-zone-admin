@@ -13,6 +13,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -37,8 +38,11 @@ if not firebase_admin._apps:
     if os.path.exists("firebase_key.json"):
         cred = credentials.Certificate("firebase_key.json")
     elif FIREBASE_CREDENTIALS_JSON:
-        cred_dict = json.loads(FIREBASE_CREDENTIALS_JSON)
-        cred = credentials.Certificate(cred_dict)
+        try:
+            cred_dict = json.loads(FIREBASE_CREDENTIALS_JSON)
+            cred = credentials.Certificate(cred_dict)
+        except Exception as e:
+            raise ValueError(f"Invalid FIREBASE_CREDENTIALS_JSON format: {e}")
     else:
         raise ValueError("Firebase credentials not found! Please check firebase_key.json or environment variables.")
     
@@ -241,7 +245,9 @@ async def manage_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.message.reply_text("➕ চ্যানেল যোগ করতে আপনার Firebase Firestore কনসোলে `channels` কালেকশনে ডকুমেন্ট তৈরি করুন যেখানে `channel_id` এবং `name` ফিল্ড থাকবে।")
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # টাইমআউট সমস্যা সমাধানের জন্য রিকোয়েস্ট কনফিগারেশন যুক্ত করা হলো
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
 
     conv_handler = ConversationHandler(
         entry_points=[
