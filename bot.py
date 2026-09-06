@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import threading
+import asyncio
 from flask import Flask
 from PIL import Image
 from dotenv import load_dotenv
@@ -46,7 +47,7 @@ def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     web_app.run(host="0.0.0.0", port=port)
 
-# ফায়ারবেস ইনিশিয়ালাইজেশন (JWT Signature Error এড়ানোর স্থায়ী সমাধানসহ)
+# ফায়ারবেস ইনিশিয়ালাইজেশন
 if not firebase_admin._apps:
     if os.path.exists("firebase_key.json"):
         cred = credentials.Certificate("firebase_key.json")
@@ -59,8 +60,6 @@ if not firebase_admin._apps:
                 clean_json = clean_json[1:-1]
                 
             cred_dict = json.loads(clean_json)
-            
-            # রেন্ডারের এনভায়রনমেন্ট ভেরিয়েবলে ভেঙে যাওয়া প্রাইভেট কি এর \n ঠিক করার ফিক্স
             if "private_key" in cred_dict:
                 cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
                 
@@ -75,7 +74,7 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # কনভারসেশন স্টেটস
-TITLE, CATEGORY, ADS_COUNT, VIDEO_LINK, THUMBNAIL, CHANNELS, ADD_CHANNEL = range(7)
+TITLE, CATEGORY, ADS_COUNT, VIDEO_LINK, THUMBNAIL, CHANNELS, ADD_CHANNEL, NEW_CATEGORY = range(8)
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -122,21 +121,32 @@ async def get_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cat_data = cat.to_dict()
         keyboard.append([InlineKeyboardButton(cat_data.get("name", "Unnamed"), callback_data=f"cat_{cat.id}")])
     
-    if not keyboard:
-        await update.message.reply_text("⚠️ কোনো ক্যাটেগরি পাওয়া যায়নি! ফায়ারবেসে আগে ক্যাটেগরি যোগ করুন। /start দিয়ে আবার শুরু করুন।")
-        return ConversationHandler.END
-
+    keyboard.append([InlineKeyboardButton("➕ Add New Category", callback_data="add_cat_prompt")])
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("📁 একটি ক্যাটেগরি সিলেক্ট করুন:", reply_markup=reply_markup)
+    await update.message.reply_text("📁 একটি ক্যাটেগরি সিলেক্ট করুন অথবা নতুন যোগ করুন:", reply_markup=reply_markup)
     return CATEGORY
 
 async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    
+    if query.data == "add_cat_prompt":
+        await query.message.reply_text("📁 নতুন ক্যাটেগরির নাম লিখুন:")
+        return NEW_CATEGORY
+        
     cat_id = query.data.split("_")[1]
     context.user_data["category"] = cat_id
     
     await query.message.reply_text("🔢 কতগুলো অ্যাড দেখলে ভিডিও আনলক হবে সংখ্যাটি লিখুন (যেমন: 1 বা 2):")
+    return ADS_COUNT
+
+async def save_new_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cat_name = update.message.text.strip()
+    cat_ref = db.collection("categories").document()
+    cat_ref.set({"name": cat_name})
+    
+    context.user_data["category"] = cat_ref.id
+    await update.message.reply_text(f"✅ ক্যাটেগরি '{cat_name}' সফলভাবে তৈরি হয়েছে!\n\n🔢 কতগুলো অ্যাড দেখলে ভিডিও আনলক হবে সংখ্যাটি লিখুন (যেমন: 1 বা 2):")
     return ADS_COUNT
 
 async def get_ads_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -158,7 +168,8 @@ async def get_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_bytes = await photo_file.download_as_bytearray()
     
     image = Image.open(io.BytesIO(photo_bytes))
-    image = image.convert("RGB")
+    if image.mode in ("RGBA", "P"):
+        image = image.convert("RGB")
     image.thumbnail((1280, 720))
     
     output = io.BytesIO()
@@ -208,7 +219,6 @@ async def channel_selection_callback(update: Update, context: ContextTypes.DEFAU
         post_ref.set(post_data)
         
         deep_link = f"https://t.me/{MINI_APP_BOT_USERNAME}/{MINI_APP_SHORT_NAME}?startapp={post_id}"
-        
         keyboard = [[InlineKeyboardButton("🎥 Watch Video in App", url=deep_link)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
@@ -221,6 +231,7 @@ async def channel_selection_callback(update: Update, context: ContextTypes.DEFAU
                     reply_markup=reply_markup,
                     parse_mode="Markdown"
                 )
+                await asyncio.sleep(0.5) # ফ্লাড প্রটেকশন ডিলে
             except Exception as e:
                 logger.error(f"Error posting to channel {ch_id}: {e}")
                 
@@ -247,16 +258,20 @@ async def channel_selection_callback(update: Update, context: ContextTypes.DEFAU
         
         try:
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Markup update error: {e}")
         return CHANNELS
 
 async def manage_categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("📁 ক্যাটেগরি ম্যানেজ করতে আপনার Firebase Firestore কনসোলে `categories` কালেকশনে একটি ডকুমেন্ট তৈরি করুন যেখানে `name` ফিল্ড থাকবে।")
+    
+    categories_ref = db.collection("categories").stream()
+    cat_list = "\n".join([f"• {cat.to_dict().get('name')}" for cat in categories_ref])
+    
+    text = f"📁 **Existing Categories:**\n\n{cat_list if cat_list else 'কোনো ক্যাটেগরি নেই।'}\n\nনতুন ক্যাটেগরি যোগ করতে সরাসরি পোস্ট পাবলিশিং উইজার্ড ব্যবহার করুন।"
+    await query.message.edit_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Main Menu", callback_data="back_to_main")]]))
 
-# --- চ্যানেল ম্যানেজমেন্ট ও আইডি দিয়ে অটো-সেভ সিস্টেম ---
 async def manage_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -332,7 +347,11 @@ def main():
         ],
         states={
             TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_title)],
-            CATEGORY: [CallbackQueryHandler(get_category, pattern="^cat_")],
+            CATEGORY: [
+                CallbackQueryHandler(get_category, pattern="^cat_"),
+                CallbackQueryHandler(get_category, pattern="^add_cat_prompt$")
+            ],
+            NEW_CATEGORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_new_category)],
             ADS_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_ads_count)],
             VIDEO_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_video_link)],
             THUMBNAIL: [MessageHandler(filters.PHOTO, get_thumbnail)],
@@ -343,7 +362,10 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, save_channel_to_firebase)
             ],
         },
-        fallbacks=[CommandHandler("start", start)],
+        fallbacks=[
+            CommandHandler("start", start),
+            CallbackQueryHandler(start, pattern="^back_to_main$")
+        ],
     )
 
     app.add_handler(conv_handler)
