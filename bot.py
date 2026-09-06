@@ -2,6 +2,8 @@ import os
 import io
 import json
 import logging
+import threading
+from flask import Flask
 from PIL import Image
 from dotenv import load_dotenv
 
@@ -33,13 +35,31 @@ MINI_APP_SHORT_NAME = os.getenv("MINI_APP_SHORT_NAME")
 ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
 FIREBASE_CREDENTIALS_JSON = os.getenv("FIREBASE_CREDENTIALS_JSON")
 
-# ফায়ারবেস ইনিশিয়ালাইজেশন (নিরাপদ পদ্ধতি)
+# রেন্ডারের পোর্ট স্ক্যানিং বা টাইমআউট সমস্যা সমাধানের জন্য ডামি ফ্লাস্ক সার্ভার
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def home():
+    return "Telegram Admin Bot is running live and active!"
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    web_app.run(host="0.0.0.0", port=port)
+
+# ফায়ারবেস ইনিশিয়ালাইজেশন (JWT Signature Error এড়ানোর নিরাপদ পদ্ধতি)
 if not firebase_admin._apps:
     if os.path.exists("firebase_key.json"):
         cred = credentials.Certificate("firebase_key.json")
     elif FIREBASE_CREDENTIALS_JSON:
         try:
-            cred_dict = json.loads(FIREBASE_CREDENTIALS_JSON)
+            # রেন্ডারের এনভায়রনমেন্ট ভেরিয়েবলের নিউলাইন ও ফরম্যাটিং ঠিক রাখার জন্য
+            clean_json = FIREBASE_CREDENTIALS_JSON.strip()
+            if clean_json.startswith("'") and clean_json.endswith("'"):
+                clean_json = clean_json[1:-1]
+            elif clean_json.startswith('"') and clean_json.endswith('"'):
+                clean_json = clean_json[1:-1]
+                
+            cred_dict = json.loads(clean_json)
             cred = credentials.Certificate(cred_dict)
         except Exception as e:
             raise ValueError(f"Invalid FIREBASE_CREDENTIALS_JSON format: {e}")
@@ -50,7 +70,7 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
-# কনভারসেশন স্টেটস (নতুন ADD_CHANNEL সহ)
+# কনভারসেশন স্টেটস
 TITLE, CATEGORY, ADS_COUNT, VIDEO_LINK, THUMBNAIL, CHANNELS, ADD_CHANNEL = range(7)
 
 logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -92,7 +112,6 @@ async def publish_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["title"] = update.message.text
     
-    # ফায়ারবেস থেকে ক্যাটেগরি ফেচ করা
     categories_ref = db.collection("categories").stream()
     keyboard = []
     for cat in categories_ref:
@@ -134,7 +153,6 @@ async def get_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photo_file = await update.message.photo[-1].get_file()
     photo_bytes = await photo_file.download_as_bytearray()
     
-    # ইমেজ রিসাইজিং ও অপ্টিমাইজেশন
     image = Image.open(io.BytesIO(photo_bytes))
     image = image.convert("RGB")
     image.thumbnail((1280, 720))
@@ -143,7 +161,6 @@ async def get_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image.save(output, format="JPEG", quality=85)
     context.user_data["thumbnail_bytes"] = output.getvalue()
     
-    # ফায়ারবেস থেকে চ্যানেল লিস্ট ফেচ করা
     channels_ref = db.collection("channels").stream()
     keyboard = []
     context.user_data["selected_channels"] = []
@@ -155,7 +172,7 @@ async def get_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard.append([InlineKeyboardButton(f"[ ] {ch_name}", callback_data=f"ch_toggle_{ch_id}")])
     
     if not keyboard:
-        await update.message.reply_text("⚠️ কোনো চ্যানেল ডাটাবেজে যুক্ত করা নেই! আগে ফায়ারবেসে চ্যানেল যোগ করুন।")
+        await update.message.reply_text("⚠️ কোনো চ্যানেল ডাটাবেজে যুক্ত করা নেই! আগে চ্যানেল যোগ করুন।")
         return ConversationHandler.END
 
     keyboard.append([InlineKeyboardButton("🚀 Confirm & Publish", callback_data="ch_publish")])
@@ -235,7 +252,7 @@ async def manage_categories_menu(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     await query.message.reply_text("📁 ক্যাটেগরি ম্যানেজ করতে আপনার Firebase Firestore কনসোলে `categories` কালেকশনে একটি ডকুমেন্ট তৈরি করুন যেখানে `name` ফিল্ড থাকবে।")
 
-# --- নতুন চ্যানেল ম্যানেজমেন্ট ও অটো-অ্যাড সিস্টেম ---
+# --- চ্যানেল ম্যানেজমেন্ট ও আইডি দিয়ে অটো-সেভ সিস্টেম ---
 async def manage_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -247,7 +264,7 @@ async def manage_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.message.edit_text(
-        "➕ **Channel Management**\n\nবটটিকে আপনার টেলিগ্রাম চ্যানেলে **Admin** হিসেবে যুক্ত করুন। এরপর নিচের বাটনে ক্লিক করে চ্যানেলের ইউজারনেম (যেমন: `@mychannel`) দিন:",
+        "➕ **Channel Management**\n\nবটটিকে আপনার টেলিগ্রাম চ্যানেলে **Admin** হিসেবে যুক্ত করুন। এরপর নিচের বাটনে ক্লিক করে চ্যানেলের **আইডি** (যেমন: `-100xxxxxxxxxx`) অথবা ইউজারনেম পাঠান:",
         reply_markup=reply_markup,
         parse_mode="Markdown"
     )
@@ -256,7 +273,7 @@ async def manage_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYP
 async def prompt_add_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.message.reply_text("📢 যে চ্যানেলে বট অ্যাড করেছেন, সেই চ্যানেলের ইউজারনেম পাঠান (যেমন: `@mychannel`):")
+    await query.message.reply_text("📢 যে চ্যানেলে বট অ্যাড করেছেন, সেই চ্যানেলের **আইডি** (যেমন: `-1001234567890`) অথবা ইউজারনেম পাঠান:")
     return ADD_CHANNEL
 
 async def save_channel_to_firebase(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,11 +282,21 @@ async def save_channel_to_firebase(update: Update, context: ContextTypes.DEFAULT
     if text.lower() == "/start":
         return await start(update, context)
 
+    # যদি ইউজার আইডি লেখে সেটি ইন্টিজারে রূপান্তর করার চেষ্টা
+    target = text
+    if text.startswith("-") or text.isdigit():
+        try:
+            target = int(text)
+        except ValueError:
+            pass
+
     try:
-        chat = await context.bot.get_chat(text)
+        # সরাসরি টেলিগ্রাম এপিআই থেকে চ্যানেল বা চ্যাটের তথ্য ফেচ করা
+        chat = await context.bot.get_chat(target)
         channel_id = str(chat.id)
-        channel_name = chat.title
+        channel_name = chat.title or chat.username or "Unknown Channel"
         
+        # ফায়ারবেসের 'channels' কালেকশনে চ্যাট আইডি দিয়ে সেভ করা
         db.collection("channels").document(channel_id).set({
             "channel_id": channel_id,
             "name": channel_name,
@@ -277,18 +304,24 @@ async def save_channel_to_firebase(update: Update, context: ContextTypes.DEFAULT
         })
         
         await update.message.reply_text(
-            f"✅ সফলভাবে চ্যানেল যুক্ত হয়েছে!\n\n📌 **নাম:** {channel_name}\n🆔 **আইডি:** `{channel_id}`",
+            f"✅ সফলভাবে ফায়ারবেসে চ্যানেল যুক্ত হয়েছে!\n\n📌 **নাম:** {channel_name}\n🆔 **আইডি:** `{channel_id}`",
             parse_mode="Markdown"
         )
     except Exception as e:
         logger.error(f"Error adding channel: {e}")
         await update.message.reply_text(
-            "❌ চ্যানেল খুঁজে পাওয়া যায়নি! নিশ্চিত করুন যে:\n1. বটটি ওই চ্যানেলে অ্যাড করা আছে।\n2. বটটিকে চ্যানেলের **Admin** করা হয়েছে।\n3. সঠিক ইউজারনেম দেওয়া হয়েছে (যেমন: `@channelname`)।"
+            "❌ চ্যানেল খুঁজে পাওয়া যায়নি বা যুক্ত করা সম্ভব হয়নি! নিশ্চিত করুন যে:\n1. বটটি ওই চ্যানেলে অ্যাড করা আছে।\n2. বটটিকে চ্যানেলের **Admin** করা হয়েছে।\n3. সঠিক চ্যানেল আইডি (যেমন `-100...`) দেওয়া হয়েছে।"
         )
     
     return ConversationHandler.END
 
 def main():
+    # ব্যাকগ্রাউন্ডে ফ্লাস্ক সার্ভার চালু করা যাতে রেন্ডার পোর্ট পেয়ে শান্ত থাকে
+    server_thread = threading.Thread(target=run_web_server)
+    server_thread.daemon = True
+    server_thread.start()
+
+    # টেলিগ্রাম বটের রিকোয়েস্ট টাইমআউট সেটআপ
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
 
@@ -318,7 +351,7 @@ def main():
     app.add_handler(CallbackQueryHandler(manage_categories_menu, pattern="^menu_categories$"))
     app.add_handler(CommandHandler("start", start))
 
-    print("Admin Bot is running smoothly with Auto Channel Add...")
+    print("Admin Bot is running with Flask Port Binding & Channel ID Support...")
     app.run_polling()
 
 if __name__ == "__main__":
