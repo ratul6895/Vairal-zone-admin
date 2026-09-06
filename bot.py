@@ -1,0 +1,266 @@
+import os
+import io
+import logging
+from PIL import Image
+from dotenv import load_dotenv
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+# এনভায়রনমেন্ট ভেরিয়েবল লোড
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+MINI_APP_BOT_USERNAME = os.getenv("MINI_APP_BOT_USERNAME")
+MINI_APP_SHORT_NAME = os.getenv("MINI_APP_SHORT_NAME")
+ADMIN_USER_IDS = [int(uid.strip()) for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()]
+FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS")
+
+# ফায়ারবেস ইনিশিয়ালাইজেশন
+if not firebase_admin._apps:
+    if os.path.exists("firebase_key.json"):
+        cred = credentials.Certificate("firebase_key.json")
+    else:
+        cred = credentials.Certificate(FIREBASE_CREDENTIALS)
+    firebase_admin.initialize_app(cred)
+
+db = firestore.client()
+
+# কনভারসেশন স্টেটস
+TITLE, CATEGORY, ADS_COUNT, VIDEO_LINK, THUMBNAIL, CHANNELS = range(6)
+
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        if update.message:
+            await update.message.reply_text("⛔ আপনার এই বটটি ব্যবহারের অনুমতি নেই।")
+        return ConversationHandler.END
+
+    keyboard = [
+        [InlineKeyboardButton("📢 New Publish Post", callback_data="menu_publish")],
+        [InlineKeyboardButton("📁 Manage Categories", callback_data="menu_categories")],
+        [InlineKeyboardButton("➕ Manage Channels", callback_data="menu_channels")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.message:
+        await update.message.reply_text("✨ **Admin Control Panel**\n\nনিচের অপশনগুলো থেকে সিলেক্ট করুন:", reply_markup=reply_markup, parse_mode="Markdown")
+    elif update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text("✨ **Admin Control Panel**\n\nনিচের অপশনগুলো থেকে সিলেক্ট করুন:", reply_markup=reply_markup, parse_mode="Markdown")
+    
+    return ConversationHandler.END
+
+# --- পোস্ট পাবলিশিং উইজার্ড শুরু ---
+async def publish_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("📝 ভিডিওর টাইটেল (Title) লিখুন:")
+    return TITLE
+
+async def get_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["title"] = update.message.text
+    
+    # ফায়ারবেস থেকে ক্যাটেগরি ফেচ করা
+    categories_ref = db.collection("categories").stream()
+    keyboard = []
+    for cat in categories_ref:
+        cat_data = cat.to_dict()
+        keyboard.append([InlineKeyboardButton(cat_data.get("name", "Unnamed"), callback_data=f"cat_{cat.id}")])
+    
+    if not keyboard:
+        await update.message.reply_text("⚠️ কোনো ক্যাটেগরি পাওয়া যায়নি! ফায়ারবেসে আগে ক্যাটেগরি যোগ করুন। /start দিয়ে আবার শুরু করুন।")
+        return ConversationHandler.END
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("📁 একটি ক্যাটেগরি সিলেক্ট করুন:", reply_markup=reply_markup)
+    return CATEGORY
+
+async def get_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cat_id = query.data.split("_")[1]
+    context.user_data["category"] = cat_id
+    
+    await query.message.reply_text("🔢 কতগুলো অ্যাড দেখলে ভিডিও আনলক হবে সংখ্যাটি লিখুন (যেমন: 1 বা 2):")
+    return ADS_COUNT
+
+async def get_ads_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["ads_count"] = update.message.text
+    await update.message.reply_text("🔗 মেইন ভিডিওর লিংক / ডাউনলোড লিংক দিন:")
+    return VIDEO_LINK
+
+async def get_video_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["video_link"] = update.message.text
+    await update.message.reply_text("🖼️ ভিডিওর জন্য একটি থাম্বনেইল (Thumbnail Photo) দিন:")
+    return THUMBNAIL
+
+async def get_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.photo:
+        await update.message.reply_text("দয়া করে একটি সঠিক ছবি বা থাম্বনেইল দিন।")
+        return THUMBNAIL
+    
+    photo_file = await update.message.photo[-1].get_file()
+    photo_bytes = await photo_file.download_as_bytearray()
+    
+    # ইমেজ রিসাইজিং ও অপ্টিমাইজেশন
+    image = Image.open(io.BytesIO(photo_bytes))
+    image = image.convert("RGB")
+    image.thumbnail((1280, 720))
+    
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=85)
+    context.user_data["thumbnail_bytes"] = output.getvalue()
+    
+    # ফায়ারবেস থেকে চ্যানেল লিস্ট ফেচ করা
+    channels_ref = db.collection("channels").stream()
+    keyboard = []
+    context.user_data["selected_channels"] = []
+    
+    for ch in channels_ref:
+        ch_data = ch.to_dict()
+        ch_id = ch_data.get("channel_id")
+        ch_name = ch_data.get("name", "Channel")
+        keyboard.append([InlineKeyboardButton(f"[ ] {ch_name}", callback_data=f"ch_toggle_{ch_id}")])
+    
+    if not keyboard:
+        await update.message.reply_text("⚠️ কোনো চ্যানেল ডাটাবেজে যুক্ত করা নেই! আগে ফায়ারবেসে চ্যানেল যোগ করুন।")
+        return ConversationHandler.END
+
+    keyboard.append([InlineKeyboardButton("🚀 Confirm & Publish", callback_data="ch_publish")])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text("📢 যে চ্যানেলগুলোতে পোস্ট করতে চান সেগুলোতে ক্লিক করে টিক দিন, এরপর 'Confirm & Publish'-এ চাপ দিন:", reply_markup=reply_markup)
+    return CHANNELS
+
+async def channel_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    
+    if data == "ch_publish":
+        if not context.user_data.get("selected_channels"):
+            await query.edit_message_text("⚠️ কমপক্ষে একটি চ্যানেল সিলেক্ট করুন!")
+            return CHANNELS
+        
+        # ১. ফায়ারবেসে পোস্ট ডাটা সেভ করা এবং ইউনিক আইডি জেনারেট
+        post_ref = db.collection("posts").document()
+        post_id = post_ref.id
+        
+        post_data = {
+            "title": context.user_data["title"],
+            "category": context.user_data["category"],
+            "ads_count": context.user_data["ads_count"],
+            "video_link": context.user_data["video_link"],
+            "created_at": firestore.SERVER_TIMESTAMP
+        }
+        post_ref.set(post_data)
+        
+        # ২. মিনি অ্যাপের ডিপ লিংক তৈরি
+        deep_link = f"https://t.me/{MINI_APP_BOT_USERNAME}/{MINI_APP_SHORT_NAME}?startapp={post_id}"
+        
+        # ৩. চ্যানেলগুলোতে পোস্ট পাঠানো
+        keyboard = [[InlineKeyboardButton("🎥 Watch Video in App", url=deep_link)]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        for ch_id in context.user_data["selected_channels"]:
+            try:
+                await context.bot.send_photo(
+                    chat_id=ch_id,
+                    photo=context.user_data["thumbnail_bytes"],
+                    caption=f"🔥 **{context.user_data['title']}**",
+                    reply_markup=reply_markup,
+                    parse_mode="Markdown"
+                )
+            except Exception as e:
+                logger.error(f"Error posting to channel {ch_id}: {e}")
+                
+        await query.message.edit_text("✅ সফলভাবে মিনি অ্যাপের ডাটাবেজে পোস্ট লাইভ হয়েছে এবং সিলেক্ট করা টেলিগ্রাম চ্যানেলগুলোতে পোস্ট করা হয়েছে!")
+        return ConversationHandler.END
+
+    elif data.startswith("ch_toggle_"):
+        ch_id = data.replace("ch_toggle_", "")
+        selected = context.user_data["selected_channels"]
+        if ch_id in selected:
+            selected.remove(ch_id)
+        else:
+            selected.append(ch_id)
+        
+        # মার্কআপ রিলোড করা
+        channels_ref = db.collection("channels").stream()
+        keyboard = []
+        for ch in channels_ref:
+            ch_data = ch.to_dict()
+            cid = ch_data.get("channel_id")
+            cname = ch_data.get("name", "Channel")
+            icon = "✅" if cid in selected else " "
+            keyboard.append([InlineKeyboardButton(f"[{icon}] {cname}", callback_data=f"ch_toggle_{cid}")])
+        keyboard.append([InlineKeyboardButton("🚀 Confirm & Publish", callback_data="ch_publish")])
+        
+        try:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(keyboard))
+        except Exception:
+            pass
+        return CHANNELS
+
+async def manage_categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("📁 ক্যাটেগরি ম্যানেজ করতে আপনার Firebase Firestore কনসোলে `categories` কালেকশনে একটি ডকুমেন্ট তৈরি করুন যেখানে `name` ফিল্ড থাকবে।")
+
+async def manage_channels_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("➕ চ্যানেল যোগ করতে আপনার Firebase Firestore কনসোলে `channels` কালেকশনে ডকুমেন্ট তৈরি করুন যেখানে `channel_id` এবং `name` ফিল্ড থাকবে।")
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(publish_start, pattern="^menu_publish$"),
+            CommandHandler("start", start)
+        ],
+        states={
+            TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_title)],
+            CATEGORY: [CallbackQueryHandler(get_category, pattern="^cat_")],
+            ADS_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_ads_count)],
+            VIDEO_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_video_link)],
+            THUMBNAIL: [MessageHandler(filters.PHOTO, get_thumbnail)],
+            CHANNELS: [CallbackQueryHandler(channel_selection_callback)],
+        },
+        fallbacks=[CommandHandler("start", start)],
+    )
+
+    app.add_handler(conv_handler)
+    app.add_handler(CallbackQueryHandler(manage_categories_menu, pattern="^menu_categories$"))
+    app.add_handler(CallbackQueryHandler(manage_channels_menu, pattern="^menu_channels$"))
+    app.add_handler(CommandHandler("start", start))
+
+    print("Admin Bot is running smoothly...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
