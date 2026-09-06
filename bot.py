@@ -46,13 +46,12 @@ def run_web_server():
     port = int(os.environ.get("PORT", 10000))
     web_app.run(host="0.0.0.0", port=port)
 
-# ফায়ারবেস ইনিশিয়ালাইজেশন (JWT Signature Error এড়ানোর নিরাপদ পদ্ধতি)
+# ফায়ারবেস ইনিশিয়ালাইজেশন (JWT Signature Error এড়ানোর স্থায়ী সমাধানসহ)
 if not firebase_admin._apps:
     if os.path.exists("firebase_key.json"):
         cred = credentials.Certificate("firebase_key.json")
     elif FIREBASE_CREDENTIALS_JSON:
         try:
-            # রেন্ডারের এনভায়রনমেন্ট ভেরিয়েবলের নিউলাইন ও ফরম্যাটিং ঠিক রাখার জন্য
             clean_json = FIREBASE_CREDENTIALS_JSON.strip()
             if clean_json.startswith("'") and clean_json.endswith("'"):
                 clean_json = clean_json[1:-1]
@@ -60,6 +59,11 @@ if not firebase_admin._apps:
                 clean_json = clean_json[1:-1]
                 
             cred_dict = json.loads(clean_json)
+            
+            # রেন্ডারের এনভায়রনমেন্ট ভেরিয়েবলে ভেঙে যাওয়া প্রাইভেট কি এর \n ঠিক করার ফিক্স
+            if "private_key" in cred_dict:
+                cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
+                
             cred = credentials.Certificate(cred_dict)
         except Exception as e:
             raise ValueError(f"Invalid FIREBASE_CREDENTIALS_JSON format: {e}")
@@ -282,7 +286,6 @@ async def save_channel_to_firebase(update: Update, context: ContextTypes.DEFAULT
     if text.lower() == "/start":
         return await start(update, context)
 
-    # যদি ইউজার আইডি লেখে সেটি ইন্টিজারে রূপান্তর করার চেষ্টা
     target = text
     if text.startswith("-") or text.isdigit():
         try:
@@ -291,12 +294,10 @@ async def save_channel_to_firebase(update: Update, context: ContextTypes.DEFAULT
             pass
 
     try:
-        # সরাসরি টেলিগ্রাম এপিআই থেকে চ্যানেল বা চ্যাটের তথ্য ফেচ করা
         chat = await context.bot.get_chat(target)
         channel_id = str(chat.id)
         channel_name = chat.title or chat.username or "Unknown Channel"
         
-        # ফায়ারবেসের 'channels' কালেকশনে চ্যাট আইডি দিয়ে সেভ করা
         db.collection("channels").document(channel_id).set({
             "channel_id": channel_id,
             "name": channel_name,
@@ -316,12 +317,10 @@ async def save_channel_to_firebase(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 def main():
-    # ব্যাকগ্রাউন্ডে ফ্লাস্ক সার্ভার চালু করা যাতে রেন্ডার পোর্ট পেয়ে শান্ত থাকে
     server_thread = threading.Thread(target=run_web_server)
     server_thread.daemon = True
     server_thread.start()
 
-    # টেলিগ্রাম বটের রিকোয়েস্ট টাইমআউট সেটআপ
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
 
